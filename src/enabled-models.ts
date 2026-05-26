@@ -14,7 +14,7 @@
 
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { getAgentDir } from "@mariozechner/pi-coding-agent";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ModelEntry } from "./model-resolver.js";
 
 /** Minimal registry shape — only the methods resolveEnabledModels actually calls. */

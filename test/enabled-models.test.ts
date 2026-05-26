@@ -150,7 +150,7 @@ describe("resolveEnabledModels", () => {
 
   describe("getAvailable filtering", () => {
     it("resolves only against available models when getAvailable present", () => {
-      const available = [MODELS[0], MODELS[4]]; // google + haiku only
+      const available = [MODELS[0], MODELS[3]]; // google + haiku only
       const result = resolveEnabledModels(
         ["anthropic/claude-haiku-4-5", "anthropic/claude-sonnet-4-6", "google/gemma-4-31b-it"],
         makeRegistry(MODELS, available),
