@@ -194,8 +194,8 @@ All fields are optional — sensible defaults for everything.
 |-------|---------|-------------|
 | `description` | filename | Agent description shown in tool listings |
 | `display_name` | — | Display name for UI (e.g. widget, agent list) |
-| `tools` | all 7 | Comma-separated built-in tools: read, bash, edit, write, grep, find, ls. `none` for no tools |
-| `extensions` | `true` | Inherit MCP/extension tools. `false` to disable |
+| `tools` | all 7 | Which tools the agent can call. Built-in names (`read, grep, …`), `*` / `all` (all built-ins), `none`, and `ext:<extension>` / `ext:<extension>/<tool>` selectors for extension tools. See [Tool & extension scoping](#tool--extension-scoping) below |
+| `extensions` | `true` | Which extensions to load for the agent. `true` (all defaults), `false` (none), or an explicit list: `[mcp, "/abs/path.ts", "*"]`. See [Tool & extension scoping](#tool--extension-scoping) below |
 | `skills` | `true` | Inherit skills from parent. Can be a comma-separated list of skill names to preload (see [Skill Preloading](#skill-preloading) for discovery locations) |
 | `memory` | — | Persistent agent memory scope: `project`, `local`, or `user`. Auto-detects read-only agents |
 | `disallowed_tools` | — | Comma-separated tools to deny even if extensions provide them |
@@ -206,10 +206,41 @@ All fields are optional — sensible defaults for everything.
 | `prompt_mode` | `replace` | `replace`: body is the full system prompt (no AGENTS.md / CLAUDE.md inheritance). `append`: body appended to parent's prompt (agent acts as a "parent twin" — inherits parent's AGENTS.md / CLAUDE.md) |
 | `inherit_context` | `false` | Fork parent conversation into agent |
 | `run_in_background` | `false` | Run in background by default |
-| `isolated` | `false` | No extension/MCP tools, only built-in |
+| `isolated` | `false` | Hermetic specialist mode: forces `extensions: false` + `skills: false` + drops `ext:` selectors. Only built-in tools. Distinct from `isolation: worktree` (filesystem) |
 | `enabled` | `true` | Set to `false` to disable an agent (useful for hiding a default agent per-project) |
 
 Frontmatter is authoritative. If an agent file sets `model`, `thinking`, `max_turns`, `inherit_context`, `run_in_background`, `isolated`, or `isolation`, those values are locked for that agent. `Agent` tool parameters only fill fields the agent config leaves unspecified.
+
+### Tool & extension scoping
+
+`extensions:` decides **which extensions load**, `tools:` decides **which tools surface to the LLM**. They compose:
+
+```yaml
+# Default (both omitted): all extensions load, all 7 built-ins surface
+
+tools: read, grep, find           # narrow to listed built-ins; extensions still load
+tools: "*"                        # all 7 built-ins (alias: `all`)
+tools: none                       # zero built-ins (alias: `""`)
+tools: "*, ext:mcp/search"        # built-ins plus one extension tool
+
+extensions: false                 # no extensions load
+extensions: [mcp]                 # only mcp loads
+extensions: ["*", "/abs/foo.ts"]  # all defaults plus one path-loaded extension
+
+# Specialist: load one extension, expose only one of its tools, keep built-ins
+extensions: [mcp]
+tools: "*, ext:mcp/search"
+
+isolated: true                    # hermetic: built-ins only, no extensions/skills/context
+```
+
+A few rules the examples don't make obvious:
+
+- `extensions:` is the sole loading authority. `ext:foo` in `tools:` narrows what surfaces; it can't load `foo` on its own. Mismatches fire `extension-error:…` warnings.
+- Any `ext:` entry flips extension tools to an explicit allowlist — unnamed extensions still load (handlers fire) but expose no tools. So `tools: "*, ext:mcp/search"` exposes only `search` from `mcp`, nothing from any other extension.
+- Extension names match case-insensitively (`[Mcp]` = `[mcp]`); tool names in `ext:foo/bar` stay case-sensitive.
+- Plain `tools:` typos fail loudly: `tools: reed, grep` fires `tools-error:…` instead of silently producing an under-tooled agent.
+- Array and string forms are equivalent: `[a, b]` == `"a, b"`.
 
 ## Tools
 
