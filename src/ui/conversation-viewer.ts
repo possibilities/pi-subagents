@@ -194,13 +194,25 @@ export class ConversationViewer implements Component {
       // Actions on the left, navigation on the right. The scroll hint keeps its
       // full key list so the less-obvious bindings stay discoverable; it leads
       // the right group so "Esc close" is the only part that truncates first.
+      const sep = th.fg("dim", " · ");
       const actions: string[] = [];
       if (this.canSteer()) actions.push(th.fg("dim", "Enter steer"));
       if (this.isStoppable()) {
         actions.push(this.stopArmed ? th.fg("error", "x again to STOP") : th.fg("dim", "x stop"));
       }
-      const footerLeft = actions.join(th.fg("dim", " · "));
       const footerRight = th.fg("dim", "↑↓ scroll · PgUp/PgDn or Shift+↑↓ · Esc close");
+
+      // Prepend the line-count/scroll-% readout only when there's spare width —
+      // it's the first thing dropped so it never crowds out the hints.
+      const scrollPct = contentLines.length <= viewportHeight
+        ? "100%"
+        : `${Math.round(((visibleStart + viewportHeight) / contentLines.length) * 100)}%`;
+      const count = th.fg("dim", `${contentLines.length} lines · ${scrollPct}`);
+      const withCount = [count, ...actions].join(sep);
+      const footerLeft = visibleWidth(withCount) + visibleWidth(footerRight) + 1 <= innerW
+        ? withCount
+        : actions.join(sep);
+
       const footerGap = Math.max(1, innerW - visibleWidth(footerLeft) - visibleWidth(footerRight));
       lines.push(row(footerLeft + " ".repeat(footerGap) + footerRight));
     }
