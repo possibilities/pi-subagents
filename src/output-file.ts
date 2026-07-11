@@ -86,7 +86,22 @@ export function streamToOutputFile(
   };
 
   const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
-    if (event.type === "turn_end") flush();
+    if (event.type === "turn_end") {
+      flush();
+    } else if (event.type === "compaction_end") {
+      // Compaction replaces session.messages with a shorter, summarized array,
+      // leaving the running index past the new end so streaming stops. Skip
+      // aborted/failed compactions (messages unchanged). The event fires
+      // synchronously and an overflow retry then removes the final error
+      // message AFTER it, so re-anchor once the current stack unwinds — a
+      // synchronous anchor could sit one past the trimmed array and skip the
+      // first post-compaction message.
+      if (!event.aborted && event.result) {
+        queueMicrotask(() => {
+          writtenCount = session.messages.length;
+        });
+      }
+    }
   });
 
   return () => {
