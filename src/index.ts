@@ -461,6 +461,20 @@ export default function (pi: ExtensionAPI) {
 
   // --- Cross-extension RPC via pi.events ---
   let currentCtx: ExtensionContext | undefined;
+  // Nested (subagent) sessions activate their own extension instance on the
+  // shared event bus but never receive lifecycle events, so per-instance ctx
+  // capture can't serve their RPC spawns — a subagent's own Task/Agent spawn
+  // (e.g. an orchestrator spawning a judge) fails with "No active session".
+  // Share the last-known ctx process-wide: instances that DO see lifecycle
+  // events keep it fresh, and an instance that saw none falls back to it.
+  // Symbol.for keeps this correct across duplicate module copies.
+  const LAST_CTX_KEY = Symbol.for("pi-subagents:last-ctx");
+  const rememberCtx = (ctx: ExtensionContext) => {
+    currentCtx = ctx;
+    (globalThis as any)[LAST_CTX_KEY] = ctx;
+  };
+  const resolveCtx = (): ExtensionContext | undefined =>
+    currentCtx ?? ((globalThis as any)[LAST_CTX_KEY] as ExtensionContext | undefined);
 
   // ---- Subagent scheduler ----
   // Session-scoped: store is constructed inside session_start once sessionId
@@ -485,9 +499,16 @@ export default function (pi: ExtensionAPI) {
 
   // Capture ctx from session_start for RPC spawn handler + start the scheduler.
   pi.on("session_start", async (_event, ctx) => {
-    currentCtx = ctx;
+    rememberCtx(ctx);
     manager.clearCompleted(true);
     if (isSchedulingEnabled() && !scheduler.isActive()) startScheduler(ctx);
+  });
+
+  // Every turn carries ctx and turn_start fires before any tool call can reach
+  // the RPC, so this keeps the process-wide fallback fresh even in sessions
+  // whose own session_start never reached this instance.
+  pi.on("turn_start", async (_event, ctx) => {
+    rememberCtx(ctx);
   });
 
   pi.on("session_before_switch", () => {
@@ -498,7 +519,7 @@ export default function (pi: ExtensionAPI) {
   const { unsubPing: unsubPingRpc, unsubSpawn: unsubSpawnRpc, unsubStop: unsubStopRpc } = registerRpcHandlers({
     events: pi.events,
     pi,
-    getCtx: () => currentCtx,
+    getCtx: () => resolveCtx(),
     manager,
   });
 
