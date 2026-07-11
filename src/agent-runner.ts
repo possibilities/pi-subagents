@@ -4,7 +4,7 @@
 
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, resolve } from "node:path";
-import type { Model } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Model, StopReason } from "@earendil-works/pi-ai";
 import type { ExtensionContext, LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
 import {
   type AgentSession,
@@ -247,6 +247,22 @@ export interface RunResult {
   aborted: boolean;
   /** True if the agent was steered to wrap up (hit soft turn limit) but finished in time. */
   steered: boolean;
+  /**
+   * Set when the run produced no usable text because its final assistant turn
+   * was a provider error, an abort, or an empty length stop. Carries the
+   * terminal stop reason so the caller surfaces an honest failure instead of a
+   * "completed" run with an empty result. Undefined whenever responseText is
+   * non-empty — a real answer completes regardless of how the turn stopped.
+   */
+  failure?: RunFailure;
+}
+
+/** Terminal-failure detail for a run that ended without any usable output. */
+export interface RunFailure {
+  /** The final assistant message's stop reason, if one was recorded. */
+  stopReason?: StopReason;
+  /** Explanation carrying the stop reason and any provider error message. */
+  message: string;
 }
 
 /**
@@ -256,7 +272,11 @@ export interface RunResult {
 function collectResponseText(session: AgentSession) {
   let text = "";
   const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
-    if (event.type === "message_start") {
+    // message_start fires for user and toolResult messages too — resetting on
+    // those would discard the assistant text we've already collected (a
+    // trailing tool-result turn would wipe the answer). Reset only when a new
+    // ASSISTANT message begins.
+    if (event.type === "message_start" && event.message.role === "assistant") {
       text = "";
     }
     if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
@@ -266,15 +286,48 @@ function collectResponseText(session: AgentSession) {
   return { getText: () => text, unsubscribe };
 }
 
-/** Get the last assistant text from the completed session history. */
+/**
+ * Get the text of the final assistant message in the session history. Only the
+ * final message counts: walking further back would return an earlier turn's
+ * text when the last turn ended empty (a provider error or length stop) — on a
+ * resumed session that reports the previous answer as this run's result.
+ */
 function getLastAssistantText(session: AgentSession): string {
-  for (let i = session.messages.length - 1; i >= 0; i--) {
-    const msg = session.messages[i];
-    if (msg.role !== "assistant") continue;
-    const text = extractText(msg.content).trim();
-    if (text) return text;
+  const last = lastAssistantMessage(session);
+  return last ? extractText(last.content).trim() : "";
+}
+
+/** The final assistant message in the session history, if any. */
+function lastAssistantMessage(session: AgentSession): AssistantMessage | undefined {
+  const messages = session.messages ?? [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "assistant") return messages[i] as AssistantMessage;
   }
-  return "";
+  return undefined;
+}
+
+/**
+ * Classify a run that produced no usable text. pi's agent loop resolves an
+ * exhausted provider failure normally — an empty assistant message carrying
+ * `stopReason` ("error" / "aborted" / "length") plus `errorMessage` — so
+ * without this a failed run would be reported as completed with an empty
+ * result. The returned message carries the stop reason and the provider's
+ * error text.
+ */
+export function classifyEmptyResult(session: AgentSession): RunFailure {
+  const last = lastAssistantMessage(session);
+  const stopReason = last?.stopReason;
+  const errorMessage = last?.errorMessage?.trim();
+  switch (stopReason) {
+    case "error":
+      return { stopReason, message: errorMessage || "subagent stopped on a provider error before producing any output" };
+    case "aborted":
+      return { stopReason, message: errorMessage || "subagent was aborted before producing any output" };
+    case "length":
+      return { stopReason, message: errorMessage || "subagent hit the length limit before producing any output" };
+    default:
+      return { stopReason, message: errorMessage || "subagent produced no output" };
+  }
 }
 
 /**
@@ -673,7 +726,10 @@ export async function runAgent(
   }
 
   const responseText = collector.getText().trim() || getLastAssistantText(session);
-  return { responseText, session, aborted, steered: softLimitReached };
+  // A run with no textual output is not a completion: classify the terminal
+  // stop reason so the manager reports a failure, not an empty result.
+  const failure = responseText ? undefined : classifyEmptyResult(session);
+  return { responseText, session, aborted, steered: softLimitReached, failure };
 }
 
 /**

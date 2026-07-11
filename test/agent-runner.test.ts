@@ -170,6 +170,86 @@ describe("agent-runner final output capture", () => {
     expect(result.responseText).toBe("LOCKED");
   });
 
+  it("keeps the streamed assistant text when a trailing tool-result turn starts", async () => {
+    // message_start fires for user/toolResult messages too. The old collector
+    // reset on ANY message_start, so a tool-result turn arriving after the
+    // answer wiped it. With no recoverable text in session.messages, the
+    // collector is the only source — proving the reset is now assistant-scoped.
+    const { session, listeners } = createSession("");
+    session.messages = [];
+    session.prompt = vi.fn(async () => {
+      const emit = (e: any) => {
+        for (const l of [...listeners]) l(e);
+      };
+      emit({ type: "message_start", message: { role: "assistant" } });
+      emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "the answer" } });
+      emit({ type: "message_end", message: { role: "assistant" } });
+      emit({ type: "message_start", message: { role: "toolResult" } });
+    });
+    createAgentSession.mockResolvedValue({ session });
+
+    const result = await runAgent(ctx, "Explore", "go", { pi });
+
+    expect(result.responseText).toBe("the answer");
+  });
+
+  it("surfaces a terminal failure carrying the stop reason when a run ends with no usable text", async () => {
+    const { session } = createSession("");
+    session.messages = [{ role: "assistant", content: [], stopReason: "error", errorMessage: "fetch failed" }];
+    session.prompt = vi.fn(async () => {});
+    createAgentSession.mockResolvedValue({ session });
+
+    const result = await runAgent(ctx, "Explore", "go", { pi });
+
+    expect(result.responseText).toBe("");
+    expect(result.failure?.stopReason).toBe("error");
+    expect(result.failure?.message).toBe("fetch failed");
+  });
+
+  it("returns no failure when a non-empty result comes back", async () => {
+    const { session } = createSession("REAL");
+    createAgentSession.mockResolvedValue({ session });
+
+    const result = await runAgent(ctx, "Explore", "go", { pi });
+
+    expect(result.responseText).toBe("REAL");
+    expect(result.failure).toBeUndefined();
+  });
+
+  it("does not fall back past an empty final turn to an earlier turn's text", async () => {
+    // The history fallback reads the FINAL assistant message only: an earlier
+    // turn's text must not mask a final empty provider-error turn as the
+    // run's answer.
+    const { session } = createSession("");
+    session.messages = [
+      { role: "assistant", content: [{ type: "text", text: "working on it" }], stopReason: "stop" },
+      { role: "toolResult", content: [] },
+      { role: "assistant", content: [], stopReason: "error", errorMessage: "fetch failed" },
+    ];
+    session.prompt = vi.fn(async () => {});
+    createAgentSession.mockResolvedValue({ session });
+
+    const result = await runAgent(ctx, "Explore", "go", { pi });
+
+    expect(result.responseText).toBe("");
+    expect(result.failure?.stopReason).toBe("error");
+    expect(result.failure?.message).toBe("fetch failed");
+  });
+
+  it("resumeAgent returns empty when the resumed turn ends empty, not the previous answer", async () => {
+    const { session } = createSession("");
+    session.messages = [
+      { role: "assistant", content: [{ type: "text", text: "previous answer" }], stopReason: "stop" },
+    ];
+    session.prompt = vi.fn(async () => {
+      session.messages.push({ role: "assistant", content: [], stopReason: "error", errorMessage: "socket hang up" });
+    });
+
+    const text = await resumeAgent(session as any, "continue", {});
+
+    expect(text).toBe("");
+  });
+
   it("binds extensions before prompting", async () => {
     const { session } = createSession("BOUND");
     createAgentSession.mockResolvedValue({ session });

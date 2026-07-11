@@ -11,7 +11,7 @@ import { statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
+import { classifyEmptyResult, resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import type { AgentInvocation, AgentRecord, IsolationMode, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage } from "./usage.js";
 import { cleanupWorktree, createWorktree, pruneWorktrees, } from "./worktree.js";
@@ -287,12 +287,22 @@ export class AgentManager {
         options.onSessionCreated?.(session);
       },
     })
-      .then(({ responseText, session, aborted, steered }) => {
+      .then(({ responseText, session, aborted, steered, failure }) => {
         // Don't overwrite status if externally stopped via abort()
         if (record.status !== "stopped") {
-          record.status = aborted ? "aborted" : steered ? "steered" : "completed";
+          if (aborted) {
+            record.status = "aborted";
+          } else if (failure) {
+            // No usable output — report the terminal stop reason (provider
+            // error / abort / empty length stop) as a failure instead of a
+            // completed run with an empty result.
+            record.status = "error";
+            record.error = failure.message;
+          } else {
+            record.status = steered ? "steered" : "completed";
+          }
         }
-        record.result = responseText;
+        record.result = responseText || undefined;
         record.session = session;
         record.completedAt ??= Date.now();
 
@@ -460,8 +470,15 @@ export class AgentManager {
         },
         signal,
       });
-      record.status = "completed";
-      record.result = responseText;
+      if (responseText) {
+        record.status = "completed";
+        record.result = responseText;
+      } else {
+        // Same rule as the spawn path: an empty resume result is a terminal
+        // failure carrying the stop reason, not a silent completion.
+        record.status = "error";
+        record.error = classifyEmptyResult(record.session).message;
+      }
       record.completedAt = Date.now();
     } catch (err) {
       record.status = "error";
