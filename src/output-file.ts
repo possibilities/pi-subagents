@@ -86,7 +86,16 @@ export function streamToOutputFile(
   };
 
   const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
-    if (event.type === "turn_end") flush();
+    if (event.type === "turn_end") {
+      flush();
+    } else if (event.type === "compaction_end") {
+      // Compaction REPLACES session.messages with a shorter, summarized array.
+      // Our running index would then point past the new end, so the flush loop
+      // never fires again and streaming halts forever. Everything up to the
+      // pre-compaction state is already in the file; re-anchor the index to the
+      // new length so post-compaction turns keep streaming from there.
+      writtenCount = session.messages.length;
+    }
   });
 
   return () => {

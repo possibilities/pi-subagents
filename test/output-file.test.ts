@@ -52,7 +52,7 @@ describe("encodeCwd", () => {
  * helpers to mutate state and fire events deterministically.
  */
 function makeFakeSession(initialMessages: unknown[] = []) {
-  const messages: unknown[] = [...initialMessages];
+  let messages: unknown[] = [...initialMessages];
   let cb: ((event: unknown) => void) | null = null;
   return {
     get messages() {
@@ -66,6 +66,11 @@ function makeFakeSession(initialMessages: unknown[] = []) {
     },
     push(...msgs: unknown[]) {
       messages.push(...msgs);
+    },
+    /** Simulate a session compaction: REPLACE the messages array wholesale
+     *  (upstream swaps in a shorter, summarized transcript). */
+    compact(newMessages: unknown[]) {
+      messages = [...newMessages];
     },
     fire(event: unknown) {
       cb?.(event);
@@ -167,5 +172,34 @@ describe("streamToOutputFile", () => {
     session.push({ role: "assistant", content: [{ type: "text", text: "ghost" }] });
     session.fire({ type: "turn_end" });
     expect(readEntries()).toHaveLength(2);
+  });
+
+  it("keeps streaming after a compaction replaces the messages array", async () => {
+    // Compaction swaps session.messages for a shorter, summarized array. The
+    // old running index then pointed past the new end, so the flush loop never
+    // fired again and streaming halted forever. Re-anchoring on compaction_end
+    // lets post-compaction turns continue streaming.
+    const session = makeFakeSession([{ role: "user", content: "go" }]);
+    streamToOutputFile(session as never, outPath, "agent-1", "/work");
+
+    // Pre-compaction turn flushes normally.
+    session.push({ role: "assistant", content: [{ type: "text", text: "before" }] });
+    session.fire({ type: "turn_end" });
+    expect(readEntries()).toHaveLength(2);
+
+    // Compaction shrinks the transcript to a single summary message.
+    session.compact([{ role: "assistant", content: [{ type: "text", text: "summary" }] }]);
+    session.fire({ type: "compaction_end" });
+
+    // A post-compaction turn appends new messages instead of silently halting.
+    session.push({ role: "assistant", content: [{ type: "text", text: "after" }] });
+    session.fire({ type: "turn_end" });
+
+    const entries = readEntries();
+    const texts = entries.map((e) => {
+      const msg = e.message as { content?: Array<{ text?: string }> };
+      return msg.content?.[0]?.text;
+    });
+    expect(texts).toContain("after");
   });
 });
