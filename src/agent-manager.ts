@@ -6,6 +6,7 @@
  * Foreground agents bypass the queue (they block the parent anyway).
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import { isAbsolute } from "node:path";
@@ -23,6 +24,80 @@ export type CompactionInfo = { reason: "manual" | "threshold" | "overflow"; toke
 
 /** Default max concurrent background agents. */
 const DEFAULT_MAX_CONCURRENT = 4;
+const DEFAULT_CANCEL_TIMEOUT_MS = 5_000;
+
+export interface ScopeCancellationResult {
+  settled: boolean;
+  failures: string[];
+}
+
+interface OwnershipScope {
+  handle: string;
+  agentId: string;
+  manager: AgentManager;
+  parent?: string;
+  children: Set<string>;
+  ctx: ExtensionContext;
+  cancelReason?: unknown;
+  cancelPromise?: Promise<ScopeCancellationResult>;
+}
+
+interface OwnershipRuntime {
+  storage: AsyncLocalStorage<string>;
+  scopes: Map<string, OwnershipScope>;
+}
+
+const OWNERSHIP_RUNTIME_KEY = Symbol.for("pi-subagents:ownership-runtime");
+const ownershipRuntime = (() => {
+  const globals = globalThis as typeof globalThis & { [OWNERSHIP_RUNTIME_KEY]?: OwnershipRuntime };
+  globals[OWNERSHIP_RUNTIME_KEY] ??= {
+    storage: new AsyncLocalStorage<string>(),
+    scopes: new Map<string, OwnershipScope>(),
+  };
+  return globals[OWNERSHIP_RUNTIME_KEY];
+})();
+
+export function getActiveScopeContext(): ExtensionContext | undefined {
+  const handle = ownershipRuntime.storage.getStore();
+  return handle ? ownershipRuntime.scopes.get(handle)?.ctx : undefined;
+}
+
+export function captureActiveScopeContext(): () => ExtensionContext | undefined {
+  const handle = ownershipRuntime.storage.getStore();
+  return () => handle ? ownershipRuntime.scopes.get(handle)?.ctx : undefined;
+}
+
+export function setActiveScopeContext(ctx: ExtensionContext): void {
+  const handle = ownershipRuntime.storage.getStore();
+  const scope = handle ? ownershipRuntime.scopes.get(handle) : undefined;
+  if (scope) scope.ctx = ctx;
+}
+
+export function getOwnedAgentRecord(id: string): AgentRecord | undefined {
+  for (const scope of ownershipRuntime.scopes.values()) {
+    if (scope.agentId === id) return scope.manager.getRecord(id);
+  }
+  return undefined;
+}
+
+export function abortOwnedAgent(id: string, reason?: unknown): boolean {
+  for (const scope of ownershipRuntime.scopes.values()) {
+    if (scope.agentId === id) return scope.manager.abort(id, reason);
+  }
+  return false;
+}
+
+function waitWithin<T>(promise: Promise<T>, deadline: number): Promise<boolean> {
+  const remaining = Math.max(0, deadline - Date.now());
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), remaining);
+    timer.unref();
+    promise.then(
+      () => { clearTimeout(timer); resolve(true); },
+      () => { clearTimeout(timer); resolve(true); },
+    );
+  });
+}
 
 /**
  * Validate a caller-supplied SpawnOptions.cwd. `undefined`/`null` mean "unset"
@@ -54,7 +129,7 @@ interface SpawnArgs {
   options: SpawnOptions;
 }
 
-interface SpawnOptions {
+export interface SpawnOptions {
   description: string;
   model?: Model<any>;
   maxTurns?: number;
@@ -107,6 +182,9 @@ export class AgentManager {
   /** Base repos worktrees were created from — so dispose() can prune them all,
    *  not just the parent repo (caller-supplied cwd can target other repos). */
   private worktreeRepos = new Set<string>();
+  private scopeByAgent = new Map<string, string>();
+  private stopReasons = new Map<string, unknown>();
+  private disposed = false;
 
   /** Queue of background agents waiting to start. */
   private queue: { id: string; args: SpawnArgs }[] = [];
@@ -156,6 +234,8 @@ export class AgentManager {
     assertValidSpawnCwd(options.cwd);
 
     const id = randomUUID().slice(0, 17);
+    const scopeHandle = randomUUID();
+    const parentHandle = ownershipRuntime.storage.getStore();
     const abortController = new AbortController();
     const record: AgentRecord = {
       id,
@@ -176,6 +256,20 @@ export class AgentManager {
       invocation: options.invocation,
     };
     this.agents.set(id, record);
+    const scope: OwnershipScope = {
+      handle: scopeHandle,
+      agentId: id,
+      manager: this,
+      parent: parentHandle,
+      children: new Set(),
+      ctx,
+      cancelReason: parentHandle
+        ? ownershipRuntime.scopes.get(parentHandle)?.cancelReason
+        : undefined,
+    };
+    ownershipRuntime.scopes.set(scopeHandle, scope);
+    ownershipRuntime.scopes.get(parentHandle ?? "")?.children.add(scopeHandle);
+    this.scopeByAgent.set(id, scopeHandle);
 
     const args: SpawnArgs = { pi, ctx, type, prompt, options };
 
@@ -191,6 +285,7 @@ export class AgentManager {
       this.startAgent(id, record, args);
     } catch (err) {
       this.agents.delete(id);
+      this.removeScope(id);
       throw err;
     }
     return id;
@@ -238,13 +333,14 @@ export class AgentManager {
     // Wire parent abort signal to stop the subagent when the parent is interrupted
     let detachParentSignal: (() => void) | undefined;
     if (options.signal) {
-      const onParentAbort = () => this.abort(id);
+      const onParentAbort = () => this.abort(id, options.signal?.reason);
       options.signal.addEventListener("abort", onParentAbort, { once: true });
       detachParentSignal = () => options.signal!.removeEventListener("abort", onParentAbort);
     }
     const detach = () => { detachParentSignal?.(); detachParentSignal = undefined; };
 
-    const promise = runAgent(ctx, type, prompt, {
+    const scopeHandle = this.scopeByAgent.get(id)!;
+    const promise = ownershipRuntime.storage.run(scopeHandle, () => runAgent(ctx, type, prompt, {
       pi,
       agentId: id,
       model: options.model,
@@ -286,13 +382,16 @@ export class AgentManager {
         }
         options.onSessionCreated?.(session);
       },
-    })
+    }))
       .then(({ responseText, session, aborted, steered, failure }) => {
-        // Don't overwrite status if externally stopped via abort()
-        if (record.status !== "stopped") {
-          // Precedence: a hard abort keeps "aborted"; then a failed final turn
-          // (provider error that pi resolved instead of rejecting, #144) is an
-          // honest "error" — not a completion with an empty or stale result.
+        if (this.stopReasons.has(id)) {
+          record.status = "stopped";
+        } else if (record.status !== "stopped") {
+          // An external stop that bypassed the scoped-stop registry still wins
+          // over a late resolution. Then: a hard abort keeps "aborted"; a failed
+          // final turn (provider error that pi resolved instead of rejecting,
+          // #144) is an honest "error" — never a completion with an empty or
+          // stale result.
           if (aborted) {
             record.status = "aborted";
           } else if (failure) {
@@ -340,11 +439,12 @@ export class AgentManager {
         return responseText;
       })
       .catch((err) => {
-        // Don't overwrite status if externally stopped via abort()
-        if (record.status !== "stopped") {
+        if (this.stopReasons.has(id)) {
+          record.status = "stopped";
+        } else {
           record.status = "error";
+          record.error = err instanceof Error ? err.message : String(err);
         }
-        record.error = err instanceof Error ? err.message : String(err);
         record.completedAt ??= Date.now();
 
         detach();
@@ -374,9 +474,14 @@ export class AgentManager {
           this.drainQueue();
         }
         return "";
+      })
+      .finally(() => {
+        this.stopReasons.delete(id);
       });
 
     record.promise = promise;
+    const scope = ownershipRuntime.scopes.get(scopeHandle);
+    if (scope?.cancelReason !== undefined) this.abort(id, scope.cancelReason);
 
     // Notify caller that spawn is complete (record is in the map, promise is set).
     // Called synchronously — onSessionCreated fires asynchronously inside runAgent.
@@ -516,23 +621,82 @@ export class AgentManager {
     );
   }
 
-  abort(id: string): boolean {
+  abort(id: string, reason?: unknown): boolean {
     const record = this.agents.get(id);
     if (!record) return false;
 
-    // Remove from queue if queued
     if (record.status === "queued") {
       this.queue = this.queue.filter(q => q.id !== id);
+      this.stopReasons.set(id, reason);
+      record.abortController?.abort(reason);
       record.status = "stopped";
       record.completedAt = Date.now();
       return true;
     }
 
+    if (record.status === "stopping") return true;
     if (record.status !== "running") return false;
-    record.abortController?.abort();
-    record.status = "stopped";
-    record.completedAt = Date.now();
+    this.stopReasons.set(id, reason);
+    record.abortController?.abort(reason);
+    record.status = "stopping";
     return true;
+  }
+
+  getScopeHandle(id: string): string | undefined {
+    return this.scopeByAgent.get(id);
+  }
+
+  async cancelScope(
+    handle: string,
+    reason: unknown = "Cancelled by owner",
+    timeoutMs = DEFAULT_CANCEL_TIMEOUT_MS,
+  ): Promise<ScopeCancellationResult | undefined> {
+    const scope = ownershipRuntime.scopes.get(handle);
+    if (!scope) return undefined;
+    if (scope.cancelPromise) return scope.cancelPromise;
+    scope.cancelReason = reason;
+    scope.cancelPromise = this.finalizeScope(scope, Date.now() + timeoutMs);
+    return scope.cancelPromise;
+  }
+
+  private async finalizeScope(scope: OwnershipScope, deadline: number): Promise<ScopeCancellationResult> {
+    const failures: string[] = [];
+    const visited = new Set<string>();
+
+    while (true) {
+      const pendingChildren = [...scope.children]
+        .filter((handle) => !visited.has(handle))
+        .map((handle) => ownershipRuntime.scopes.get(handle))
+        .filter((child): child is OwnershipScope => child !== undefined);
+      if (pendingChildren.length === 0) break;
+      for (const child of pendingChildren) {
+        visited.add(child.handle);
+        child.cancelReason ??= scope.cancelReason;
+        child.cancelPromise ??= child.manager.finalizeScope(child, deadline);
+      }
+      const results = await Promise.all(pendingChildren.map((child) => child.cancelPromise!));
+      for (const result of results) failures.push(...result.failures);
+      if (Date.now() >= deadline) break;
+    }
+
+    ownershipRuntime.storage.run(scope.handle, () => {
+      scope.manager.abort(scope.agentId, scope.cancelReason);
+    });
+    const record = scope.manager.getRecord(scope.agentId);
+    if (record?.promise && !(await waitWithin(record.promise, deadline))) {
+      failures.push(`Agent ${scope.agentId} did not settle before cancellation timeout`);
+    }
+
+    for (const handle of scope.children) {
+      if (visited.has(handle)) continue;
+      const child = ownershipRuntime.scopes.get(handle);
+      if (!child) continue;
+      child.cancelReason ??= scope.cancelReason;
+      child.cancelPromise ??= child.manager.finalizeScope(child, deadline);
+      const result = await child.cancelPromise;
+      failures.push(...result.failures);
+    }
+    return { settled: failures.length === 0, failures };
   }
 
   /** Dispose a record's session and remove it from the map. */
@@ -540,12 +704,25 @@ export class AgentManager {
     record.session?.dispose?.();
     record.session = undefined;
     this.agents.delete(id);
+    this.removeScope(id);
+  }
+
+  private removeScope(id: string): void {
+    const handle = this.scopeByAgent.get(id);
+    if (!handle) return;
+    const scope = ownershipRuntime.scopes.get(handle);
+    if (scope) {
+      ownershipRuntime.scopes.get(scope.parent ?? "")?.children.delete(handle);
+      ownershipRuntime.scopes.delete(handle);
+    }
+    this.scopeByAgent.delete(id);
+    this.stopReasons.delete(id);
   }
 
   private cleanup() {
     const cutoff = Date.now() - 10 * 60_000;
     for (const [id, record] of this.agents) {
-      if (record.status === "running" || record.status === "queued") continue;
+      if (record.status === "running" || record.status === "stopping" || record.status === "queued") continue;
       if ((record.completedAt ?? 0) >= cutoff) continue;
       this.removeRecord(id, record);
     }
@@ -559,7 +736,7 @@ export class AgentManager {
    */
   clearCompleted(skipUnconsumed = false): void {
     for (const [id, record] of this.agents) {
-      if (record.status === "running" || record.status === "queued") continue;
+      if (record.status === "running" || record.status === "stopping" || record.status === "queued") continue;
       if (skipUnconsumed && !record.resultConsumed) continue;
       this.removeRecord(id, record);
     }
@@ -568,30 +745,16 @@ export class AgentManager {
   /** Whether any agents are still running or queued. */
   hasRunning(): boolean {
     return [...this.agents.values()].some(
-      r => r.status === "running" || r.status === "queued",
+      r => r.status === "running" || r.status === "stopping" || r.status === "queued",
     );
   }
 
-  /** Abort all running and queued agents immediately. */
-  abortAll(): number {
+  /** Request cancellation for all running and queued agents. */
+  abortAll(reason?: unknown): number {
     let count = 0;
-    // Clear queued agents first
-    for (const queued of this.queue) {
-      const record = this.agents.get(queued.id);
-      if (record) {
-        record.status = "stopped";
-        record.completedAt = Date.now();
-        count++;
-      }
-    }
-    this.queue = [];
-    // Abort running agents
     for (const record of this.agents.values()) {
-      if (record.status === "running") {
-        record.abortController?.abort();
-        record.status = "stopped";
-        record.completedAt = Date.now();
-        count++;
+      if (record.status === "running" || record.status === "queued") {
+        if (this.abort(record.id, reason)) count++;
       }
     }
     return count;
@@ -604,7 +767,7 @@ export class AgentManager {
     while (true) {
       this.drainQueue();
       const pending = [...this.agents.values()]
-        .filter(r => r.status === "running" || r.status === "queued")
+        .filter(r => r.status === "running" || r.status === "stopping" || r.status === "queued")
         .map(r => r.promise)
         .filter(Boolean);
       if (pending.length === 0) break;
@@ -612,14 +775,20 @@ export class AgentManager {
     }
   }
 
-  dispose() {
+  async dispose(): Promise<void> {
+    if (this.disposed) return;
+    this.disposed = true;
     clearInterval(this.cleanupInterval);
-    // Clear queue
+    const roots = [...this.scopeByAgent.values()]
+      .map((handle) => ownershipRuntime.scopes.get(handle))
+      .filter((scope): scope is OwnershipScope => scope?.manager === this)
+      .filter((scope) => {
+        const parent = scope.parent ? ownershipRuntime.scopes.get(scope.parent) : undefined;
+        return parent?.manager !== this;
+      });
+    await Promise.all(roots.map((scope) => this.cancelScope(scope.handle, "Agent manager disposed", 250)));
     this.queue = [];
-    for (const record of this.agents.values()) {
-      record.session?.dispose();
-    }
-    this.agents.clear();
+    for (const [id, record] of this.agents) this.removeRecord(id, record);
     // Prune any orphaned git worktrees (crash recovery)
     try { pruneWorktrees(process.cwd()); } catch { /* ignore */ }
     // Also prune repos that caller-supplied cwds created worktrees in — a clean
