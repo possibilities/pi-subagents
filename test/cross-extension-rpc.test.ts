@@ -1,14 +1,20 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { type EventBus, PROTOCOL_VERSION, type RpcDeps, registerRpcHandlers, type SpawnCapable } from "../src/cross-extension-rpc.js";
+import {
+  type EventBus,
+  PROTOCOL_VERSION,
+  type RpcDeps,
+  registerRpcHandlers,
+  type SpawnCapable,
+} from "../src/cross-extension-rpc.js";
 
-/** Simple in-process event bus for testing. */
 function createEventBus(): EventBus {
   const listeners = new Map<string, Set<(data: unknown) => void>>();
   return {
     on(event, handler) {
-      if (!listeners.has(event)) listeners.set(event, new Set());
-      listeners.get(event)!.add(handler);
-      return () => { listeners.get(event)?.delete(handler); };
+      const handlers = listeners.get(event) ?? new Set();
+      handlers.add(handler);
+      listeners.set(event, handlers);
+      return () => handlers.delete(handler);
     },
     emit(event, data) {
       for (const handler of listeners.get(event) ?? []) handler(data);
@@ -16,305 +22,183 @@ function createEventBus(): EventBus {
   };
 }
 
-describe("cross-extension RPC", () => {
+function request<T>(events: EventBus, channel: string, params: object): Promise<T> {
+  const requestId = (params as { requestId: string }).requestId;
+  return new Promise((resolve) => {
+    const unsub = events.on(`${channel}:reply:${requestId}`, (reply) => {
+      unsub();
+      resolve(reply as T);
+    });
+    events.emit(channel, params);
+  });
+}
+
+describe("cross-extension RPC v3", () => {
   let events: EventBus;
   let manager: SpawnCapable;
-  let ctx: object | undefined;
+  let ctx: RpcDeps["getCtx"] extends () => infer T ? T : never;
   let deps: RpcDeps;
 
   beforeEach(() => {
     events = createEventBus();
-    manager = { spawn: vi.fn().mockReturnValue("agent-42"), abort: vi.fn().mockReturnValue(true) };
-    ctx = { session: true };
-    deps = { events, pi: { events }, getCtx: () => ctx, manager };
-  });
-
-  // --- ping ---
-
-  describe("ping RPC", () => {
-    it("replies with protocol version", async () => {
-      registerRpcHandlers(deps);
-      const reply = vi.fn();
-      events.on("subagents:rpc:ping:reply:req-1", reply);
-      events.emit("subagents:rpc:ping", { requestId: "req-1" });
-
-      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
-      expect(reply).toHaveBeenCalledWith({ success: true, data: { version: PROTOCOL_VERSION } });
-    });
-
-    it("scopes replies — other requestIds do not receive it", async () => {
-      registerRpcHandlers(deps);
-      const wrongReply = vi.fn();
-      events.on("subagents:rpc:ping:reply:req-other", wrongReply);
-      events.emit("subagents:rpc:ping", { requestId: "req-1" });
-
-      await new Promise((r) => setTimeout(r, 20));
-      expect(wrongReply).not.toHaveBeenCalled();
-    });
-
-    it("unsub stops responding to pings", async () => {
-      const { unsubPing } = registerRpcHandlers(deps);
-      unsubPing();
-
-      const reply = vi.fn();
-      events.on("subagents:rpc:ping:reply:req-1", reply);
-      events.emit("subagents:rpc:ping", { requestId: "req-1" });
-
-      await new Promise((r) => setTimeout(r, 20));
-      expect(reply).not.toHaveBeenCalled();
-    });
-  });
-
-  // --- spawn ---
-
-  describe("spawn RPC", () => {
-    it("returns agent id on success", async () => {
-      registerRpcHandlers(deps);
-      const reply = vi.fn();
-      events.on("subagents:rpc:spawn:reply:req-s1", reply);
-      events.emit("subagents:rpc:spawn", {
-        requestId: "req-s1", type: "general-purpose", prompt: "do stuff",
-      });
-
-      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
-      expect(reply).toHaveBeenCalledWith({ success: true, data: { id: "agent-42" } });
-      expect(manager.spawn).toHaveBeenCalledWith(
-        deps.pi, ctx, "general-purpose", "do stuff", {},
-      );
-    });
-
-    it("passes options through to manager.spawn", async () => {
-      registerRpcHandlers(deps);
-      const reply = vi.fn();
-      events.on("subagents:rpc:spawn:reply:req-s2", reply);
-      events.emit("subagents:rpc:spawn", {
-        requestId: "req-s2", type: "Explore", prompt: "find it",
-        options: { description: "search", isBackground: true },
-      });
-
-      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
-      expect(manager.spawn).toHaveBeenCalledWith(
-        deps.pi, ctx, "Explore", "find it",
-        { description: "search", isBackground: true },
-      );
-    });
-
-    it("returns error when no active session", async () => {
-      ctx = undefined;
-      registerRpcHandlers(deps);
-      const reply = vi.fn();
-      events.on("subagents:rpc:spawn:reply:req-s3", reply);
-      events.emit("subagents:rpc:spawn", {
-        requestId: "req-s3", type: "general-purpose", prompt: "x",
-      });
-
-      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
-      expect(reply).toHaveBeenCalledWith({ success: false, error: "No active session" });
-      expect(manager.spawn).not.toHaveBeenCalled();
-    });
-
-    it("returns error when manager.spawn throws", async () => {
-      (manager.spawn as ReturnType<typeof vi.fn>).mockImplementation(() => {
-        throw new Error("unknown agent type");
-      });
-      registerRpcHandlers(deps);
-      const reply = vi.fn();
-      events.on("subagents:rpc:spawn:reply:req-s4", reply);
-      events.emit("subagents:rpc:spawn", {
-        requestId: "req-s4", type: "bad-type", prompt: "x",
-      });
-
-      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
-      expect(reply).toHaveBeenCalledWith({ success: false, error: "unknown agent type" });
-    });
-
-    it("scopes replies — other requestIds do not receive it", async () => {
-      registerRpcHandlers(deps);
-      const wrongReply = vi.fn();
-      const rightReply = vi.fn();
-      events.on("subagents:rpc:spawn:reply:req-other", wrongReply);
-      events.on("subagents:rpc:spawn:reply:req-s5", rightReply);
-      events.emit("subagents:rpc:spawn", {
-        requestId: "req-s5", type: "general-purpose", prompt: "x",
-      });
-
-      await vi.waitFor(() => expect(rightReply).toHaveBeenCalled());
-      expect(wrongReply).not.toHaveBeenCalled();
-    });
-
-    it("unsub stops responding to spawns", async () => {
-      const { unsubSpawn } = registerRpcHandlers(deps);
-      unsubSpawn();
-
-      const reply = vi.fn();
-      events.on("subagents:rpc:spawn:reply:req-s6", reply);
-      events.emit("subagents:rpc:spawn", {
-        requestId: "req-s6", type: "general-purpose", prompt: "x",
-      });
-
-      // Give any potential async handler time to fire
-      await new Promise((r) => setTimeout(r, 20));
-      expect(reply).not.toHaveBeenCalled();
-    });
-  });
-
-  // --- stop ---
-
-  describe("stop RPC", () => {
-    it("returns success when agent is aborted", async () => {
-      registerRpcHandlers(deps);
-      const reply = vi.fn();
-      events.on("subagents:rpc:stop:reply:req-st1", reply);
-      events.emit("subagents:rpc:stop", { requestId: "req-st1", agentId: "agent-42" });
-
-      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
-      expect(reply).toHaveBeenCalledWith({ success: true });
-      expect(manager.abort).toHaveBeenCalledWith("agent-42");
-    });
-
-    it("returns error when agent not found", async () => {
-      (manager.abort as ReturnType<typeof vi.fn>).mockReturnValue(false);
-      registerRpcHandlers(deps);
-      const reply = vi.fn();
-      events.on("subagents:rpc:stop:reply:req-st2", reply);
-      events.emit("subagents:rpc:stop", { requestId: "req-st2", agentId: "nonexistent" });
-
-      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
-      expect(reply).toHaveBeenCalledWith({ success: false, error: "Agent not found" });
-    });
-
-    it("scopes replies — other requestIds do not receive it", async () => {
-      registerRpcHandlers(deps);
-      const wrongReply = vi.fn();
-      const rightReply = vi.fn();
-      events.on("subagents:rpc:stop:reply:req-other", wrongReply);
-      events.on("subagents:rpc:stop:reply:req-st3", rightReply);
-      events.emit("subagents:rpc:stop", { requestId: "req-st3", agentId: "agent-42" });
-
-      await vi.waitFor(() => expect(rightReply).toHaveBeenCalled());
-      expect(wrongReply).not.toHaveBeenCalled();
-    });
-
-    it("unsub stops responding to stop requests", async () => {
-      const { unsubStop } = registerRpcHandlers(deps);
-      unsubStop();
-
-      const reply = vi.fn();
-      events.on("subagents:rpc:stop:reply:req-st4", reply);
-      events.emit("subagents:rpc:stop", { requestId: "req-st4", agentId: "agent-42" });
-
-      await new Promise((r) => setTimeout(r, 20));
-      expect(reply).not.toHaveBeenCalled();
-    });
-  });
-
-  // --- concurrent requests ---
-
-  describe("concurrent requests", () => {
-    it("handles multiple simultaneous spawn requests independently", async () => {
-      let callCount = 0;
-      (manager.spawn as ReturnType<typeof vi.fn>).mockImplementation(() => `agent-${++callCount}`);
-      registerRpcHandlers(deps);
-
-      const reply1 = vi.fn();
-      const reply2 = vi.fn();
-      events.on("subagents:rpc:spawn:reply:req-a", reply1);
-      events.on("subagents:rpc:spawn:reply:req-b", reply2);
-
-      events.emit("subagents:rpc:spawn", { requestId: "req-a", type: "Explore", prompt: "first" });
-      events.emit("subagents:rpc:spawn", { requestId: "req-b", type: "Plan", prompt: "second" });
-
-      await vi.waitFor(() => {
-        expect(reply1).toHaveBeenCalled();
-        expect(reply2).toHaveBeenCalled();
-      });
-
-      expect(reply1).toHaveBeenCalledWith({ success: true, data: { id: "agent-1" } });
-      expect(reply2).toHaveBeenCalledWith({ success: true, data: { id: "agent-2" } });
-    });
-  });
-
-  // --- model override resolution (regression for cross-extension callers
-  //     that forward a serializable string instead of a Model object) ---
-
-  describe("spawn RPC model override", () => {
-    const fakeModel = { id: "gpt-5.5", provider: "openai-codex", name: "GPT 5.5" };
-    const registry = {
-      find: (provider: string, id: string) =>
-        provider === fakeModel.provider && id === fakeModel.id ? fakeModel : null,
-      getAll: () => [fakeModel],
-      getAvailable: () => [fakeModel],
+    manager = {
+      spawn: vi.fn().mockReturnValue("agent-42"),
+      getScopeHandle: vi.fn().mockReturnValue("opaque-owner-handle"),
+      cancelScope: vi.fn().mockResolvedValue({ settled: true, failures: [] }),
     };
+    ctx = { session: true } as never;
+    deps = {
+      events,
+      pi: { events } as never,
+      getCtx: () => ctx,
+      resolveType: (type) => ["general-purpose", "Explore", "Plan"].includes(type) ? type : undefined,
+      manager,
+    };
+  });
 
-    beforeEach(() => {
-      ctx = { session: true, modelRegistry: registry };
-      deps = { events, pi: { events }, getCtx: () => ctx, manager };
+  it("reports the current protocol version", async () => {
+    registerRpcHandlers(deps);
+    await expect(request(events, "subagents:rpc:ping", { requestId: "ping" }))
+      .resolves.toEqual({ success: true, data: { version: PROTOCOL_VERSION } });
+    expect(PROTOCOL_VERSION).toBe(3);
+  });
+
+  it("fails loudly when an older facade omits the protocol version", async () => {
+    registerRpcHandlers(deps);
+    await expect(request(events, "subagents:rpc:spawn", {
+      requestId: "old",
+      type: "general-purpose",
+      prompt: "work",
+    })).resolves.toEqual({
+      success: false,
+      error: "RPC protocol mismatch: expected 3, received missing",
+    });
+    expect(manager.spawn).not.toHaveBeenCalled();
+  });
+
+  it("strictly resolves a named type and returns an opaque owner handle", async () => {
+    registerRpcHandlers(deps);
+    await expect(request(events, "subagents:rpc:spawn", {
+      requestId: "spawn",
+      version: PROTOCOL_VERSION,
+      type: "Explore",
+      prompt: "find it",
+      options: { description: "search" },
+    })).resolves.toEqual({
+      success: true,
+      data: { id: "agent-42", handle: "opaque-owner-handle" },
+    });
+    expect(manager.spawn).toHaveBeenCalledWith(
+      deps.pi,
+      ctx,
+      "Explore",
+      "find it",
+      { description: "search" },
+    );
+  });
+
+  it("rejects unknown types instead of falling back to general-purpose", async () => {
+    registerRpcHandlers(deps);
+    await expect(request(events, "subagents:rpc:spawn", {
+      requestId: "missing",
+      version: PROTOCOL_VERSION,
+      type: "missing-agent",
+      prompt: "work",
+    })).resolves.toEqual({
+      success: false,
+      error: "Unknown or disabled agent type: \"missing-agent\"",
+    });
+    expect(manager.spawn).not.toHaveBeenCalled();
+  });
+
+  it("requires an active context", async () => {
+    ctx = undefined as never;
+    registerRpcHandlers(deps);
+    await expect(request(events, "subagents:rpc:spawn", {
+      requestId: "no-context",
+      version: PROTOCOL_VERSION,
+      type: "general-purpose",
+      prompt: "work",
+    })).resolves.toEqual({ success: false, error: "No active session" });
+  });
+
+  it("resolves serializable model overrides", async () => {
+    const model = { id: "gpt-5.5", provider: "openai-codex", name: "GPT 5.5" };
+    ctx = {
+      modelRegistry: {
+        find: (provider: string, id: string) => provider === model.provider && id === model.id ? model : null,
+        getAll: () => [model],
+        getAvailable: () => [model],
+      },
+    } as never;
+    registerRpcHandlers(deps);
+
+    await request(events, "subagents:rpc:spawn", {
+      requestId: "model",
+      version: PROTOCOL_VERSION,
+      type: "general-purpose",
+      prompt: "work",
+      options: { description: "work", model: "openai-codex/gpt-5.5" },
     });
 
-    it("resolves a string model to a Model instance before manager.spawn", async () => {
-      registerRpcHandlers(deps);
-      const reply = vi.fn();
-      events.on("subagents:rpc:spawn:reply:req-m1", reply);
-      events.emit("subagents:rpc:spawn", {
-        requestId: "req-m1", type: "general-purpose", prompt: "x",
-        options: { model: "openai-codex/gpt-5.5" },
-      });
+    expect(manager.spawn).toHaveBeenCalledWith(
+      deps.pi,
+      ctx,
+      "general-purpose",
+      "work",
+      { description: "work", model },
+    );
+  });
 
-      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
-      expect(reply).toHaveBeenCalledWith({ success: true, data: { id: "agent-42" } });
-      expect(manager.spawn).toHaveBeenCalledWith(
-        deps.pi, ctx, "general-purpose", "x",
-        { model: fakeModel },
-      );
+  it("acknowledges cancellation only after the manager finalizer settles", async () => {
+    let settle!: (value: { settled: boolean; failures: string[] }) => void;
+    vi.mocked(manager.cancelScope).mockReturnValue(new Promise((resolve) => { settle = resolve; }));
+    registerRpcHandlers(deps);
+
+    let replied = false;
+    const response = request(events, "subagents:rpc:stop", {
+      requestId: "stop",
+      version: PROTOCOL_VERSION,
+      handle: "opaque-owner-handle",
+      reason: "panel cancelled",
+    }).then((reply) => { replied = true; return reply; });
+    await Promise.resolve();
+    expect(replied).toBe(false);
+
+    settle({ settled: true, failures: [] });
+    await expect(response).resolves.toEqual({
+      success: true,
+      data: { settled: true, failures: [] },
     });
+    expect(manager.cancelScope).toHaveBeenCalledWith("opaque-owner-handle", "panel cancelled");
+  });
 
-    it("passes a Model object through unchanged", async () => {
-      registerRpcHandlers(deps);
-      const reply = vi.fn();
-      events.on("subagents:rpc:spawn:reply:req-m2", reply);
-      events.emit("subagents:rpc:spawn", {
-        requestId: "req-m2", type: "general-purpose", prompt: "x",
-        options: { model: fakeModel },
-      });
-
-      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
-      expect(manager.spawn).toHaveBeenCalledWith(
-        deps.pi, ctx, "general-purpose", "x",
-        { model: fakeModel },
-      );
+  it("reports a bounded cancellation failure", async () => {
+    vi.mocked(manager.cancelScope).mockResolvedValue({
+      settled: false,
+      failures: ["Agent child did not settle before cancellation timeout"],
     });
+    registerRpcHandlers(deps);
 
-    it("surfaces a clear error when the model string can't be resolved", async () => {
-      registerRpcHandlers(deps);
-      const reply = vi.fn();
-      events.on("subagents:rpc:spawn:reply:req-m3", reply);
-      events.emit("subagents:rpc:spawn", {
-        requestId: "req-m3", type: "general-purpose", prompt: "x",
-        options: { model: "nope/does-not-exist" },
-      });
-
-      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
-      const call = (reply as ReturnType<typeof vi.fn>).mock.calls[0][0];
-      expect(call.success).toBe(false);
-      expect(call.error).toMatch(/Model not found/);
-      expect(manager.spawn).not.toHaveBeenCalled();
+    await expect(request(events, "subagents:rpc:stop", {
+      requestId: "timeout",
+      version: PROTOCOL_VERSION,
+      handle: "opaque-owner-handle",
+    })).resolves.toEqual({
+      success: true,
+      data: {
+        settled: false,
+        failures: ["Agent child did not settle before cancellation timeout"],
+      },
     });
+  });
 
-    it("errors when ctx has no modelRegistry but a string model is given", async () => {
-      ctx = { session: true }; // no modelRegistry
-      registerRpcHandlers(deps);
-      const reply = vi.fn();
-      events.on("subagents:rpc:spawn:reply:req-m4", reply);
-      events.emit("subagents:rpc:spawn", {
-        requestId: "req-m4", type: "general-purpose", prompt: "x",
-        options: { model: "openai-codex/gpt-5.5" },
-      });
-
-      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
-      const call = (reply as ReturnType<typeof vi.fn>).mock.calls[0][0];
-      expect(call.success).toBe(false);
-      expect(call.error).toMatch(/modelRegistry is unavailable/);
-      expect(manager.spawn).not.toHaveBeenCalled();
-    });
+  it("rejects cancellation by an unscoped agent id", async () => {
+    registerRpcHandlers(deps);
+    await expect(request(events, "subagents:rpc:stop", {
+      requestId: "legacy-stop",
+      version: PROTOCOL_VERSION,
+      agentId: "agent-42",
+    })).resolves.toEqual({ success: false, error: "Ownership scope handle is required" });
   });
 });

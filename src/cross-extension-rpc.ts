@@ -1,40 +1,36 @@
 /**
  * Cross-extension RPC handlers for the subagents extension.
  *
- * Exposes ping, spawn, and stop RPCs over the pi.events event bus,
+ * Exposes versioned ping, spawn, and stop RPCs over the pi.events event bus,
  * using per-request scoped reply channels.
- *
- * Reply envelope follows pi-mono convention:
- *   success → { success: true, data?: T }
- *   error   → { success: false, error: string }
  */
 
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ScopeCancellationResult, SpawnOptions } from "./agent-manager.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
 
-/** Minimal event bus interface needed by the RPC handlers. */
 export interface EventBus {
   on(event: string, handler: (data: unknown) => void): () => void;
   emit(event: string, data: unknown): void;
 }
 
-/** RPC reply envelope — matches pi-mono's RpcResponse shape. */
 export type RpcReply<T = void> =
   | { success: true; data?: T }
   | { success: false; error: string };
 
-/** RPC protocol version — bumped when the envelope or method contracts change. */
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
-/** Minimal AgentManager interface needed by the spawn/stop RPCs. */
 export interface SpawnCapable {
-  spawn(pi: unknown, ctx: unknown, type: string, prompt: string, options: any): string;
-  abort(id: string): boolean;
+  spawn(pi: ExtensionAPI, ctx: ExtensionContext, type: string, prompt: string, options: SpawnOptions): string;
+  getScopeHandle(id: string): string | undefined;
+  cancelScope(handle: string, reason?: unknown): Promise<ScopeCancellationResult | undefined>;
 }
 
 export interface RpcDeps {
   events: EventBus;
-  pi: unknown;                    // passed through to manager.spawn
-  getCtx: () => unknown | undefined;  // returns current ExtensionContext
+  pi: ExtensionAPI;
+  getCtx: () => ExtensionContext | undefined;
+  resolveType: (type: string) => string | undefined;
   manager: SpawnCapable;
 }
 
@@ -44,10 +40,6 @@ export interface RpcHandle {
   unsubStop: () => void;
 }
 
-/**
- * Wire a single RPC handler: listen on `channel`, run `fn(params)`,
- * emit the reply envelope on `channel:reply:${requestId}`.
- */
 function handleRpc<P extends { requestId: string }>(
   events: EventBus,
   channel: string,
@@ -60,63 +52,77 @@ function handleRpc<P extends { requestId: string }>(
       const reply: { success: true; data?: unknown } = { success: true };
       if (data !== undefined) reply.data = data;
       events.emit(`${channel}:reply:${params.requestId}`, reply);
-    } catch (err: any) {
+    } catch (error) {
       events.emit(`${channel}:reply:${params.requestId}`, {
-        success: false, error: err?.message ?? String(err),
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
       });
     }
   });
 }
 
-/**
- * Register ping, spawn, and stop RPC handlers on the event bus.
- * Returns unsub functions for cleanup.
- */
+function assertProtocol(version: unknown): void {
+  if (version !== PROTOCOL_VERSION) {
+    throw new Error(
+      `RPC protocol mismatch: expected ${PROTOCOL_VERSION}, received ${version === undefined ? "missing" : String(version)}`,
+    );
+  }
+}
+
 export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
-  const { events, pi, getCtx, manager } = deps;
+  const { events, pi, getCtx, resolveType, manager } = deps;
 
   const unsubPing = handleRpc(events, "subagents:rpc:ping", () => {
     return { version: PROTOCOL_VERSION };
   });
 
-  const unsubSpawn = handleRpc<{ requestId: string; type: string; prompt: string; options?: any }>(
-    events, "subagents:rpc:spawn", ({ type, prompt, options }) => {
-      const ctx = getCtx();
-      if (!ctx) throw new Error("No active session");
+  const unsubSpawn = handleRpc<{
+    requestId: string;
+    version: number;
+    type: string;
+    prompt: string;
+    options?: SpawnOptions;
+  }>(events, "subagents:rpc:spawn", ({ version, type, prompt, options }) => {
+    assertProtocol(version);
+    const ctx = getCtx();
+    if (!ctx) throw new Error("No active session");
 
-      // Cross-extension RPC callers (e.g. pi-tasks TaskExecute) naturally
-      // forward serializable values, so options.model can be a string like
-      // "openai-codex/gpt-5.5". Resolve it to a real Model instance here
-      // — same pattern the scheduler path already uses — so the spawned
-      // agent's auth lookup doesn't crash with "No API key found for
-      // undefined".
-      let normalizedOptions = options ?? {};
-      if (typeof normalizedOptions.model === "string") {
-        const registry = (ctx as { modelRegistry?: ModelRegistry }).modelRegistry;
-        if (!registry) {
-          throw new Error(
-            `Model override "${normalizedOptions.model}" provided but ctx.modelRegistry is unavailable`,
-          );
-        }
-        const resolved = resolveModel(normalizedOptions.model, registry);
-        if (typeof resolved === "string") {
-          // resolveModel returns a human-readable error string when the
-          // input doesn't match any available model. Surface it instead of
-          // silently falling back so the caller sees the auth/typo issue.
-          throw new Error(resolved);
-        }
-        normalizedOptions = { ...normalizedOptions, model: resolved };
+    const canonicalType = resolveType(type);
+    if (!canonicalType) throw new Error(`Unknown or disabled agent type: "${type}"`);
+
+    let normalizedOptions: SpawnOptions = options ?? { description: type };
+    if (typeof normalizedOptions.model === "string") {
+      const registry = (ctx as { modelRegistry?: ModelRegistry }).modelRegistry;
+      if (!registry) {
+        throw new Error(
+          `Model override "${normalizedOptions.model}" provided but ctx.modelRegistry is unavailable`,
+        );
       }
+      const resolved = resolveModel(normalizedOptions.model, registry);
+      if (typeof resolved === "string") throw new Error(resolved);
+      normalizedOptions = { ...normalizedOptions, model: resolved };
+    }
 
-      return { id: manager.spawn(pi, ctx, type, prompt, normalizedOptions) };
-    },
-  );
+    const id = manager.spawn(pi, ctx, canonicalType, prompt, normalizedOptions);
+    const handle = manager.getScopeHandle(id);
+    if (!handle) throw new Error("Spawned agent has no ownership scope");
+    return { id, handle };
+  });
 
-  const unsubStop = handleRpc<{ requestId: string; agentId: string }>(
-    events, "subagents:rpc:stop", ({ agentId }) => {
-      if (!manager.abort(agentId)) throw new Error("Agent not found");
-    },
-  );
+  const unsubStop = handleRpc<{
+    requestId: string;
+    version: number;
+    handle: string;
+    reason?: string;
+  }>(events, "subagents:rpc:stop", async ({ version, handle, reason }) => {
+    assertProtocol(version);
+    if (typeof handle !== "string" || handle.length === 0) {
+      throw new Error("Ownership scope handle is required");
+    }
+    const result = await manager.cancelScope(handle, reason);
+    if (!result) throw new Error("Ownership scope not found");
+    return result;
+  });
 
   return { unsubPing, unsubSpawn, unsubStop };
 }

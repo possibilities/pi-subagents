@@ -26,6 +26,7 @@ vi.mock("../src/agent-runner.js", async () => {
 });
 
 import { runAgent } from "../src/agent-runner.js";
+import { PROTOCOL_VERSION } from "../src/cross-extension-rpc.js";
 import subagentsExtension from "../src/index.js";
 
 const RPC_CHANNELS = ["subagents:rpc:ping", "subagents:rpc:spawn", "subagents:rpc:stop"] as const;
@@ -133,6 +134,7 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
     const requestId = "req-142";
     await busHandlers.get("subagents:rpc:spawn")!({
       requestId,
+      version: PROTOCOL_VERSION,
       type: "general-purpose",
       prompt: "go",
       options: { description: "rpc gating test" },

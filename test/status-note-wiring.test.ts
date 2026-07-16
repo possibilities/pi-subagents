@@ -85,9 +85,18 @@ describe("status note reaches the parent through the real handlers", () => {
   });
 
   it("background user-stop → get_subagent_result flags STOPPED BY THE USER (not completed)", async () => {
-    // A background agent that never settles on its own — only a stop ends it.
-    vi.mocked(runAgent).mockReturnValue(new Promise(() => {}) as any);
-    const { pi, tools, eventHandlers, lifecycle } = makePi();
+    // The manager awaits the runner, so the mock must settle on the stop's
+    // abort signal — resolving un-aborted, so the stopReasons registry (not the
+    // runner's own flag) is what labels the record a user stop.
+    vi.mocked(runAgent).mockImplementation((_ctx, _type, _prompt, options) => new Promise((resolve) => {
+      options.signal?.addEventListener("abort", () => resolve({
+        responseText: "partial",
+        session: { dispose: vi.fn() } as any,
+        aborted: false,
+        steered: false,
+      }), { once: true });
+    }));
+    const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
     await bind(lifecycle); // register RPC channels via session_start (#142)
 
@@ -99,8 +108,10 @@ describe("status note reaches the parent through the real handlers", () => {
     const id = textOf(spawn).match(/Agent ID: (\S+)/)?.[1];
     expect(id, "background spawn should surface an agent id").toBeTruthy();
 
-    // The user stops it — same path the viewer's stop key uses (manager.abort).
-    eventHandlers.get("subagents:rpc:stop")?.({ requestId: "r1", agentId: id });
+    // The user stops it — same manager path the viewer's stop key uses.
+    const registry = (globalThis as any)[Symbol.for("pi-subagents:manager")];
+    expect(registry.abort(id, "user stop")).toBe(true);
+    await registry.getRecord(id).promise;
 
     const res = await tools.get("get_subagent_result").execute(
       "tc3", { agent_id: id }, undefined, undefined, ctx(),

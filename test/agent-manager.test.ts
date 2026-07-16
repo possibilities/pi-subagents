@@ -676,7 +676,7 @@ describe("AgentManager — abort() state machine", () => {
     expect(manager.abort(queuedId)).toBe(false);
   });
 
-  it("aborts a running agent by firing its AbortController and setting status='stopped'", () => {
+  it("aborts a running agent without claiming settlement is complete", () => {
     manager = new AgentManager();
     let receivedSignal: AbortSignal | undefined;
     vi.mocked(runAgent).mockImplementation((_ctx, _type, _prompt, opts) => {
@@ -693,8 +693,8 @@ describe("AgentManager — abort() state machine", () => {
     expect(receivedSignal?.aborted).toBe(false);
 
     expect(manager.abort(id)).toBe(true);
-    expect(record.status).toBe("stopped");
-    expect(record.completedAt).toBeGreaterThan(0);
+    expect(record.status).toBe("stopping");
+    expect(record.completedAt).toBeUndefined();
     expect(receivedSignal?.aborted).toBe(true);
   });
 
@@ -727,7 +727,7 @@ describe("AgentManager — abort() state machine", () => {
     expect(record.status).toBe("running");
 
     expect(manager.abort(id)).toBe(true);
-    expect(record.status).toBe("stopped");
+    expect(record.status).toBe("stopping");
 
     // The agent loop ends and the promise settles "normally".
     resolveRun({ responseText: "partial output", session: mockSession(), aborted: false, steered: false });
@@ -806,8 +806,8 @@ describe("AgentManager — parent abort signal forwarding (#44)", () => {
     expect(record.status).toBe("running");
 
     parent.abort();
-    expect(record.status).toBe("stopped");
-    expect(record.completedAt).toBeGreaterThan(0);
+    expect(record.status).toBe("stopping");
+    expect(record.completedAt).toBeUndefined();
   });
 });
 
@@ -852,9 +852,9 @@ describe("AgentManager — abortAll", () => {
     expect(manager.getRecord(queued)?.status).toBe("queued");
 
     expect(manager.abortAll()).toBe(2);
-    expect(manager.getRecord(running)?.status).toBe("stopped");
+    expect(manager.getRecord(running)?.status).toBe("stopping");
     expect(manager.getRecord(queued)?.status).toBe("stopped");
-    expect(manager.hasRunning()).toBe(false);
+    expect(manager.hasRunning()).toBe(true);
   });
 
   it("returns 0 when there are no running or queued agents", () => {
@@ -889,6 +889,159 @@ describe("AgentManager — hasRunning", () => {
     manager.spawn(mockPi, mockCtx, "X", "r", { description: "r", isBackground: true });
     manager.spawn(mockPi, mockCtx, "Y", "q", { description: "q", isBackground: true });
     expect(manager.hasRunning()).toBe(true);
+  });
+});
+
+describe("AgentManager — owned scope lifecycle", () => {
+  let manager: AgentManager;
+  afterEach(async () => { await manager?.dispose(); });
+
+  it("registers nested spawns beneath the active caller and cancels descendants before their parent", async () => {
+    manager = new AgentManager();
+    const abortOrder: string[] = [];
+    let childId: string | undefined;
+    let siblingSignal: AbortSignal | undefined;
+
+    vi.mocked(runAgent).mockImplementation((_ctx, type, _prompt, options) => {
+      if (type === "parent") {
+        childId = manager.spawn(mockPi, mockCtx, "child", "nested", { description: "child" });
+      }
+      const signal = options.signal!;
+      if (type === "sibling") siblingSignal = signal;
+      return new Promise((resolve) => {
+        signal.addEventListener("abort", () => {
+          abortOrder.push(type);
+          resolve({
+            responseText: "partial",
+            session: mockSession(),
+            aborted: false,
+            steered: false,
+          });
+        }, { once: true });
+      });
+    });
+
+    const parentId = manager.spawn(mockPi, mockCtx, "parent", "root", { description: "parent" });
+    const siblingId = manager.spawn(mockPi, mockCtx, "sibling", "other", { description: "sibling" });
+    const handle = manager.getScopeHandle(parentId)!;
+
+    const result = await manager.cancelScope(handle, "panel cancelled", 100);
+
+    expect(result).toEqual({ settled: true, failures: [] });
+    expect(abortOrder).toEqual(["child", "parent"]);
+    expect(manager.getRecord(childId!)?.status).toBe("stopped");
+    expect(manager.getRecord(parentId)?.status).toBe("stopped");
+    expect(manager.getRecord(siblingId)?.status).toBe("running");
+    expect(siblingSignal?.aborted).toBe(false);
+    manager.abort(siblingId);
+  });
+
+  it("preserves the first cancellation reason and makes duplicate cancellation idempotent", async () => {
+    manager = new AgentManager();
+    let seenReason: unknown;
+    vi.mocked(runAgent).mockImplementation((_ctx, _type, _prompt, options) => {
+      const signal = options.signal!;
+      return new Promise((resolve) => {
+        signal.addEventListener("abort", () => {
+          seenReason = signal.reason;
+          resolve({ responseText: "", session: mockSession(), aborted: false, steered: false });
+        }, { once: true });
+      });
+    });
+
+    const id = manager.spawn(mockPi, mockCtx, "parent", "root", { description: "parent" });
+    const handle = manager.getScopeHandle(id)!;
+    const first = manager.cancelScope(handle, "first reason", 100);
+    const duplicate = manager.cancelScope(handle, "second reason", 100);
+
+    await expect(first).resolves.toEqual({ settled: true, failures: [] });
+    await expect(duplicate).resolves.toEqual({ settled: true, failures: [] });
+    expect(seenReason).toBe("first reason");
+  });
+
+  it("includes a child spawned while parent cancellation is completing", async () => {
+    manager = new AgentManager();
+    let lateChildId: string | undefined;
+    vi.mocked(runAgent).mockImplementation((_ctx, type, _prompt, options) => {
+      const signal = options.signal!;
+      return new Promise((resolve) => {
+        signal.addEventListener("abort", () => {
+          if (type === "parent") {
+            lateChildId = manager.spawn(mockPi, mockCtx, "late-child", "nested", { description: "late" });
+          }
+          resolve({ responseText: "partial", session: mockSession(), aborted: false, steered: false });
+        }, { once: true });
+      });
+    });
+    const parentId = manager.spawn(mockPi, mockCtx, "parent", "root", { description: "parent" });
+
+    const result = await manager.cancelScope(manager.getScopeHandle(parentId)!, "stop", 100);
+
+    expect(result).toEqual({ settled: true, failures: [] });
+    expect(lateChildId).toBeDefined();
+    expect(manager.getRecord(lateChildId!)?.status).toBe("stopped");
+    expect(manager.getRecord(lateChildId!)?.completedAt).toBeGreaterThan(0);
+  });
+
+  it("reports bounded failure when an aborted session does not settle", async () => {
+    manager = new AgentManager();
+    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
+    const id = manager.spawn(mockPi, mockCtx, "parent", "root", { description: "parent" });
+
+    const result = await manager.cancelScope(manager.getScopeHandle(id)!, "stop", 5);
+
+    expect(result?.settled).toBe(false);
+    expect(result?.failures).toEqual([
+      `Agent ${id} did not settle before cancellation timeout`,
+    ]);
+    expect(manager.getRecord(id)?.status).toBe("stopping");
+  });
+
+  it("routes disposal through recursive cancellation and waits for sessions", async () => {
+    manager = new AgentManager();
+    const settled: string[] = [];
+    vi.mocked(runAgent).mockImplementation((_ctx, type, _prompt, options) => {
+      if (type === "parent") {
+        manager.spawn(mockPi, mockCtx, "child", "nested", { description: "child" });
+      }
+      return new Promise((resolve) => {
+        options.signal?.addEventListener("abort", () => {
+          settled.push(type);
+          resolve({ responseText: "", session: mockSession(), aborted: false, steered: false });
+        }, { once: true });
+      });
+    });
+    manager.spawn(mockPi, mockCtx, "parent", "root", { description: "parent" });
+
+    await manager.dispose();
+
+    expect(settled).toEqual(["child", "parent"]);
+    expect(manager.listAgents()).toEqual([]);
+  });
+
+  it("does not mark late completion terminal until the session promise settles", async () => {
+    manager = new AgentManager();
+    let finish!: () => void;
+    vi.mocked(runAgent).mockImplementation(() => new Promise((resolve) => {
+      finish = () => resolve({
+        responseText: "late partial",
+        session: mockSession(),
+        aborted: false,
+        steered: false,
+      });
+    }));
+    const id = manager.spawn(mockPi, mockCtx, "parent", "root", { description: "parent" });
+    const record = manager.getRecord(id)!;
+
+    manager.abort(id, "stop");
+    expect(record.status).toBe("stopping");
+    expect(record.completedAt).toBeUndefined();
+    finish();
+    await record.promise;
+
+    expect(record.status).toBe("stopped");
+    expect(record.completedAt).toBeGreaterThan(0);
+    expect(record.result).toBe("late partial");
   });
 });
 

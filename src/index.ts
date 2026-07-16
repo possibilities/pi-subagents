@@ -15,9 +15,9 @@ import { join } from "node:path";
 import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { AgentManager } from "./agent-manager.js";
+import { AgentManager, abortOwnedAgent, captureActiveScopeContext, getActiveScopeContext, getOwnedAgentRecord, setActiveScopeContext } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, steerAgent } from "./agent-runner.js";
-import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, isDefaultsDisabled, registerAgents, resolveType, setDefaultsDisabled } from "./agent-types.js";
+import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, isDefaultsDisabled, isValidType, registerAgents, resolveType, setDefaultsDisabled } from "./agent-types.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { isModelInScope, readEnabledModels, resolveEnabledModels } from "./enabled-models.js";
@@ -507,7 +507,8 @@ export default function (pi: ExtensionAPI) {
     hasRunning: () => manager.hasRunning(),
     spawn: (piRef: any, ctx: any, type: string, prompt: string, options: any) =>
       manager.spawn(piRef, ctx, type, prompt, options),
-    getRecord: (id: string) => manager.getRecord(id),
+    getRecord: getOwnedAgentRecord,
+    abort: abortOwnedAgent,
   };
   const ownsManagerRegistry = (globalThis as any)[MANAGER_KEY] === undefined;
   if (ownsManagerRegistry) {
@@ -524,6 +525,24 @@ export default function (pi: ExtensionAPI) {
   // (currentCtx would stay undefined → spawn always "No active session"). Gating
   // here makes a filtered session behave like an absent one (#142).
   let rpcHandle: RpcHandle | undefined;
+  // Ctx resolution for the handlers that DID register: prefer the scope of the
+  // owned recursive agent currently running, then this activation's captured
+  // scope, then the lifecycle-captured ctx, then the last ctx any activation
+  // stamped. The chain only ever serves a gated (session_start-bound)
+  // registration — it refines WHICH ctx a live registration spawns under; it
+  // never lets an unbound activation answer.
+  const getActivationScopeContext = captureActiveScopeContext();
+  const LAST_CTX_KEY = Symbol.for("pi-subagents:last-ctx");
+  const rememberCtx = (ctx: ExtensionContext) => {
+    currentCtx = ctx;
+    setActiveScopeContext(ctx);
+    (globalThis as typeof globalThis & { [LAST_CTX_KEY]?: ExtensionContext })[LAST_CTX_KEY] = ctx;
+  };
+  const resolveCtx = (): ExtensionContext | undefined =>
+    getActiveScopeContext()
+    ?? getActivationScopeContext()
+    ?? currentCtx
+    ?? (globalThis as typeof globalThis & { [LAST_CTX_KEY]?: ExtensionContext })[LAST_CTX_KEY];
 
   // ---- Subagent scheduler ----
   // Session-scoped: store is constructed inside session_start once sessionId
@@ -550,7 +569,7 @@ export default function (pi: ExtensionAPI) {
   // This also wires the RPC handlers and broadcasts readiness — on the first
   // bound session_start, so a filtered-out activation never advertises (#142).
   pi.on("session_start", async (_event, ctx) => {
-    currentCtx = ctx;
+    rememberCtx(ctx);
     manager.clearCompleted(true);
     // Guard mirrors the `!scheduler.isActive()` pattern below: session_start
     // fires once per activation, but a double-bind must not leak listeners.
@@ -558,7 +577,11 @@ export default function (pi: ExtensionAPI) {
       rpcHandle = registerRpcHandlers({
         events: pi.events,
         pi,
-        getCtx: () => currentCtx,
+        getCtx: resolveCtx,
+        resolveType: (type) => {
+          reloadCustomAgents();
+          return isValidType(type) ? resolveType(type) : undefined;
+        },
         manager,
       });
       // Broadcast readiness so extensions loaded alongside us can discover us.
@@ -567,6 +590,10 @@ export default function (pi: ExtensionAPI) {
       pi.events.emit("subagents:ready", {});
     }
     if (isSchedulingEnabled() && !scheduler.isActive()) startScheduler(ctx);
+  });
+
+  pi.on("turn_start", async (_event, ctx) => {
+    rememberCtx(ctx);
   });
 
   pi.on("session_before_switch", () => {
@@ -588,11 +615,10 @@ export default function (pi: ExtensionAPI) {
       delete (globalThis as any)[MANAGER_KEY];
     }
     scheduler.stop();
-    manager.abortAll();
     for (const timer of pendingNudges.values()) clearTimeout(timer);
     pendingNudges.clear();
     fleet.dispose();
-    manager.dispose();
+    await manager.dispose();
   });
 
   // Live widget: show running agents above editor.
@@ -709,6 +735,7 @@ export default function (pi: ExtensionAPI) {
 
   // Grab UI context from first tool execution + clear lingering widget on new turn
   pi.on("tool_execution_start", async (_event, ctx) => {
+    rememberCtx(ctx);
     widget.setUICtx(ctx.ui as UICtx);
     fleet.setUICtx(ctx.ui as unknown as FleetUICtx);
     widget.onTurnStart();
@@ -813,8 +840,7 @@ Notes:
 - description: 3-5 words (shown in UI). Prompts must be self-contained — the agent has not seen this conversation.
 - Parallel work: one message, multiple Agent calls, run_in_background: true on each. You are notified when background agents finish — never poll or sleep.
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
-- resume continues a previous agent by ID; steer_subagent messages a running one.
-- isolation: "worktree" runs the agent in an isolated git worktree; changes land on a branch.`;
+- resume continues a previous agent by ID; steer_subagent messages a running one.`;
 
   const fullAgentToolDescription = `Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
 
@@ -843,8 +869,7 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
 - Use model to specify a different model (as "provider/modelId", or fuzzy e.g. "haiku", "sonnet").
 - Use thinking to control extended thinking level.
-- Use inherit_context if the agent needs the parent conversation history.
-- Use isolation: "worktree" to run the agent in an isolated git worktree (safe parallel file modifications). The worktree is automatically cleaned up if the agent makes no changes; otherwise the path and branch are returned in the result.${scheduleGuideline}
+- Use inherit_context if the agent needs the parent conversation history.${scheduleGuideline}
 
 ## Writing the prompt
 
@@ -1470,7 +1495,7 @@ Terse command-style prompts produce shallow, generic work.
       // completion notification can still be delivered.
       // Queued agents have no promise yet (it's created when the queue starts
       // them), so poll until they leave the queue, then await like a running one.
-      if (params.wait && (record.status === "running" || record.status === "queued")) {
+      if (params.wait && (record.status === "running" || record.status === "stopping" || record.status === "queued")) {
         while (record.status === "queued") {
           await abortable(
             new Promise<void>((resolve) => setTimeout(resolve, QUEUE_WAIT_POLL_MS)),
@@ -1495,8 +1520,10 @@ Terse command-style prompts produce shallow, generic work.
         `Type: ${displayName} | Status: ${record.status}${getStatusNote(record.status)} | ${statsParts.join(" | ")}\n` +
         `Description: ${record.description}\n\n`;
 
-      if (record.status === "running") {
-        output += "Agent is still running. Use wait: true or check back later.";
+      if (record.status === "running" || record.status === "stopping") {
+        output += record.status === "stopping"
+          ? "Agent cancellation is in progress."
+          : "Agent is still running. Use wait: true or check back later.";
       } else if (record.status === "error") {
         output += `Error: ${record.error}${partialOutputSuffix(record)}`;
       } else {
@@ -1504,7 +1531,7 @@ Terse command-style prompts produce shallow, generic work.
       }
 
       // Mark result as consumed — suppresses the completion notification
-      if (record.status !== "running" && record.status !== "queued") {
+      if (record.status !== "running" && record.status !== "stopping" && record.status !== "queued") {
         record.resultConsumed = true;
         cancelNudge(params.agent_id);
       }

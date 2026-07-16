@@ -90,6 +90,7 @@ describe("toolDescriptionMode", () => {
     expect(desc).toContain("## Writing the prompt");
     // Full agent descriptions are embedded (a late Explore sentence survives).
     expect(desc).toContain("very thorough");
+    expect(desc).not.toContain('isolation: "worktree"');
   });
 
   it("compact mode swaps in the short description with one-line type list", () => {
@@ -102,6 +103,7 @@ describe("toolDescriptionMode", () => {
     expect(desc).toContain("- general-purpose:");
     expect(desc).toContain("- Explore: Fast read-only search agent for locating code. (Tools:");
     expect(desc).not.toContain("very thorough");
+    expect(desc).not.toContain('isolation: "worktree"');
     // The point of the feature: materially smaller than the full version.
     expect(desc.length).toBeLessThan(1600);
   });
@@ -121,7 +123,6 @@ describe("toolDescriptionMode", () => {
       "run_in_background",
       "resume",
       "steer_subagent",
-      'isolation: "worktree"',
       ".pi/agents/",
       "self-contained",
     ]) {
