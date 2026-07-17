@@ -376,6 +376,7 @@ describe("settings persistence", () => {
         setToolDescriptionMode: vi.fn(),
         setFleetView: vi.fn(),
         setWidgetMode: vi.fn(),
+        setOutputTranscript: vi.fn(),
       };
     });
 
@@ -458,6 +459,13 @@ describe("settings persistence", () => {
       expect(appliers.setToolDescriptionMode).toHaveBeenCalledWith("full");
     });
 
+    it("applies outputTranscript (both true and false)", () => {
+      applySettings({ outputTranscript: false }, appliers);
+      expect(appliers.setOutputTranscript).toHaveBeenCalledWith(false);
+      applySettings({ outputTranscript: true }, appliers);
+      expect(appliers.setOutputTranscript).toHaveBeenCalledWith(true);
+    });
+
     it("applies defaultMaxTurns: 0 as the explicit unlimited marker", () => {
       applySettings({ defaultMaxTurns: 0 }, appliers);
       expect(appliers.setDefaultMaxTurns).toHaveBeenCalledWith(0);
@@ -516,6 +524,7 @@ describe("settings persistence", () => {
         setToolDescriptionMode: vi.fn(),
         setFleetView: vi.fn(),
         setWidgetMode: vi.fn(),
+        setOutputTranscript: vi.fn(),
       };
     });
 
